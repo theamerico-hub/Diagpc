@@ -15,9 +15,10 @@
     try {
         New-Item -ItemType Directory -Path $tools -Force | Out-Null
         Write-Host "  Baixando para $dir ..." -ForegroundColor Gray
-        Invoke-WebRequest "$raw/DiagPC.ps1" -OutFile (Join-Path $dir 'DiagPC.ps1') -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest "$raw/Iniciar-DiagPC.bat" -OutFile (Join-Path $dir 'Iniciar-DiagPC.bat') -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest "$raw/LEIA-ME.txt" -OutFile (Join-Path $dir 'LEIA-ME.txt') -UseBasicParsing -ErrorAction SilentlyContinue
+        $nc = "?nocache=$([DateTime]::Now.Ticks)"
+        Invoke-WebRequest "$raw/DiagPC.ps1$nc" -OutFile (Join-Path $dir 'DiagPC.ps1') -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest "$raw/Iniciar-DiagPC.bat$nc" -OutFile (Join-Path $dir 'Iniciar-DiagPC.bat') -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest "$raw/LEIA-ME.txt$nc" -OutFile (Join-Path $dir 'LEIA-ME.txt') -UseBasicParsing -ErrorAction SilentlyContinue
     } catch {
         Write-Host "  Falha no download: $($_.Exception.Message)" -ForegroundColor Red
         return
@@ -28,6 +29,12 @@
         catch { Write-Host '  Aviso: smartctl nao baixado (saude % dos discos SATA ficara indisponivel).' -ForegroundColor Yellow }
     }
     Get-ChildItem $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+    $versao = '?'
+    $mv = Select-String -Path (Join-Path $dir 'DiagPC.ps1') -Pattern "VersaoDiag = '([^']+)'" | Select-Object -First 1
+    if ($mv) { $versao = $mv.Matches[0].Groups[1].Value }
+    Write-Host ''
+    Write-Host "  Versao carregada: $versao" -ForegroundColor Green
+    Write-Host ''
     Write-Host '  Abrindo o DiagPC como administrador...' -ForegroundColor Green
     try {
         Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\DiagPC.ps1`""

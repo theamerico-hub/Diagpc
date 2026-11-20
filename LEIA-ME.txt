@@ -4,7 +4,7 @@
 COMO USAR
 Pela internet (PowerShell):
    irm https://raw.githubusercontent.com/theamerico-hub/Diagpc/main/iniciar.ps1 | iex
-   (baixa para C:\DiagPC e abre como administrador)
+   (baixa para C:\DiagPC, mostra a versão e abre a janela do programa)
 
 Pelo pendrive:
 1. Copie a pasta DiagPC inteira.
@@ -19,7 +19,8 @@ Pelo pendrive:
    DiagPC\Relatorios\<NOME-DO-PC>_<data>\relatorio.html
    (também tem resumo.txt e amostras_sensores.csv, com as leituras a cada 2 s)
 
-Durante cada etapa, aperte P para pular. Ctrl+C interrompe e gera um relatório parcial.
+Na janela: botões Pular etapa, Parar (gera relatório parcial), Abrir relatório e Abrir pasta.
+Modo texto (sem janela): DiagPC.ps1 -Console  (tecla P pula a etapa, Ctrl+C interrompe)
 
 SE O PC DESLIGAR NO MEIO DO TESTE
 Ligue o PC e rode o DiagPC de novo. Ele detecta que o teste anterior não terminou e
@@ -67,4 +68,5 @@ PARÂMETROS (PowerShell)
   .\DiagPC.ps1 -Modo Completo
   .\DiagPC.ps1 -Modo Personalizado -Minutos 60 -SemGPU
   .\DiagPC.ps1 -Modo Rapido -DiasLogs 7 -NaoAbrir
-  Opções: -SemCPU -SemRAM -SemDisco -SemGPU -DiasLogs N -NaoAbrir
+  Opções: -SemCPU -SemRAM -SemDisco -SemGPU -DiasLogs N -NaoAbrir -Console
+  (informar -Modo já usa o modo texto)

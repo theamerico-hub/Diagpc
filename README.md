@@ -15,8 +15,12 @@ Abra o PowerShell e cole:
 irm https://raw.githubusercontent.com/theamerico-hub/Diagpc/main/iniciar.ps1 | iex
 ```
 
-O comando baixa o DiagPC para `C:\DiagPC` e abre como administrador. Os relatórios ficam em
-`C:\DiagPC\Relatorios`.
+O comando baixa o DiagPC para `C:\DiagPC`, mostra a versão carregada e abre a interface gráfica como
+administrador. Os relatórios ficam em `C:\DiagPC\Relatorios`.
+
+A interface mostra as leituras de CPU, GPU e memória ao vivo, a etapa atual com o tempo restante e o log dos
+resultados, com botões para pular etapa, parar e abrir o relatório. Para usar no console (texto), rode
+`DiagPC.ps1 -Console`.
 
 Para usar no pendrive, baixe o repositório (Code > Download ZIP) e clique duas vezes em `Iniciar-DiagPC.bat`.
 
@@ -29,7 +33,7 @@ Para usar no pendrive, baixe o repositório (Code > Download ZIP) e clique duas 
 | Personalizado | você escolhe | testes longos ou só alguns testes |
 | Só diagnóstico | ~2 min | logs, SMART e inventário, sem estresse |
 
-Durante cada etapa, aperte **P** para pular. **Ctrl+C** interrompe e gera um relatório parcial.
+Na interface: botões **Pular etapa** e **Parar** (gera relatório parcial). No console: tecla **P** pula a etapa e **Ctrl+C** interrompe.
 
 ## O que é testado
 

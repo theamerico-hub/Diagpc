@@ -37,12 +37,13 @@ param(
     [switch]$SemGPU,
     [ValidateRange(1, 365)]
     [int]$DiasLogs = 30,
-    [switch]$NaoAbrir
+    [switch]$NaoAbrir,
+    [switch]$Console
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$VersaoDiag = '1.3'
+$VersaoDiag = '1.4'
 
 # ---------------------------------------------------------------------------
 #  Administrador
@@ -81,11 +82,8 @@ try {
     New-Item -ItemType Directory -Path $ToolsDir, $RelRoot -Force | Out-Null
 }
 $ArqEstado = Join-Path $RelRoot '.estado.json'
-$PastaRel = Join-Path $RelRoot ('{0}_{1:yyyy-MM-dd_HH-mm}' -f $env:COMPUTERNAME, (Get-Date))
-New-Item -ItemType Directory -Path $PastaRel -Force | Out-Null
-$ArqCsv = Join-Path $PastaRel 'amostras_sensores.csv'
-$ArqHtml = Join-Path $PastaRel 'relatorio.html'
-$ArqTxt = Join-Path $PastaRel 'resumo.txt'
+$script:ParamsOriginais = @{} + $PSBoundParameters
+$script:Gui = $false
 
 $RepoRaw = 'https://raw.githubusercontent.com/theamerico-hub/Diagpc/main'
 $LhmUrl = 'https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/v0.9.4/LibreHardwareMonitor-net472.zip'
@@ -121,6 +119,9 @@ public static class DiagSys {
     public static void ManterAcordado(bool ligado) {
         SetThreadExecutionState(ligado ? 0x80000003u : 0x80000000u);
     }
+    [DllImport("kernel32.dll")] private static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public static void OcultarConsole() { try { IntPtr h = GetConsoleWindow(); if (h != IntPtr.Zero) ShowWindow(h, 0); } catch { } }
     public static void DesativarQuickEdit() {
         try {
             IntPtr h = GetStdHandle(-10);
@@ -541,12 +542,21 @@ function Format-Duracao([double]$seg) {
 }
 
 function Write-Etapa([string]$titulo, [string]$sub = '') {
+    if ($script:Gui) {
+        Add-GuiLog ''
+        Add-GuiLog ("> " + $titulo) 'Cyan' -Negrito
+        if ($sub) { Add-GuiLog "   $sub" 'DarkGray' }
+        $script:G.etapa.Text = $titulo; $script:G.etapa.ForeColor = [Drawing.Color]::White; $script:G.resta.Text = ''
+        [System.Windows.Forms.Application]::DoEvents()
+        return
+    }
     Write-Host ''
     Write-Host (("== {0} " -f $titulo).PadRight(78, '=')) -ForegroundColor Cyan
     if ($sub) { Write-Host "   $sub" -ForegroundColor DarkGray }
 }
 
 function Write-Linha([string]$t) {
+    if ($script:Gui) { return }
     $w = 119
     try { $w = [Console]::WindowWidth - 1 } catch {}
     if ($w -lt 40) { $w = 79 }
@@ -555,6 +565,11 @@ function Write-Linha([string]$t) {
 }
 
 function Test-TeclaPular {
+    if ($script:Gui) {
+        [System.Windows.Forms.Application]::DoEvents()
+        if ($script:PularSolicitado) { $script:PularSolicitado = $false; return $true }
+        return $false
+    }
     try {
         while ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
@@ -592,6 +607,7 @@ function Test-ExecucaoAnterior {
 
     $p = Get-Process -Id $e.PID -ErrorAction SilentlyContinue
     if ($p -and $p.Id -ne $PID -and $p.StartTime.ToString('yyyy-MM-ddTHH:mm:ss') -eq $e.PIDInicio) {
+        if ($script:Gui) { [Windows.Forms.MessageBox]::Show('Já existe outro DiagPC rodando neste computador. Feche-o antes.', 'DiagPC') | Out-Null; throw 'Outro DiagPC já está rodando' }
         Write-Host 'Já existe outro DiagPC rodando neste computador. Feche-o antes.' -ForegroundColor Red
         Read-Host 'ENTER para sair' | Out-Null
         exit
@@ -796,7 +812,7 @@ function Invoke-Fase {
         [scriptblock]$Status = { '' }, [scriptblock]$Terminou = { $false }
     )
     $script:FaseAtual = $Nome
-    Write-Etapa $Nome ("duração prevista: {0}   (aperte P para pular esta etapa)" -f (Format-Duracao $Segundos))
+    Write-Etapa $Nome ("duração prevista: {0}{1}" -f (Format-Duracao $Segundos), $(if ($script:Gui) { '' } else { '   (aperte P para pular esta etapa)' }))
     $reg = [pscustomobject]@{ Nome = $Nome; Inicio = Get-Date; Fim = $null; Situacao = 'Concluída'; Obs = '' }
     $script:Fases.Add($reg)
     $quentes = 0
@@ -811,6 +827,8 @@ function Invoke-Fase {
             Add-Amostra $s
             $extra = & $Status
             Write-Linha (' {0} | {1} | resta {2}' -f (Format-Leitura $s), $extra, (Format-Duracao ($Segundos - $dec)))
+            if ($script:Gui) { Update-GuiLeitura $s $extra ($Segundos - $dec) $Segundos }
+            if ($script:CancelarSolicitado) { $reg.Situacao = 'Interrompida pelo usuário'; break }
             if (($null -ne $s.CpuTemp -and $s.CpuTemp -ge $LIM.EmergCpu) -or ($null -ne $s.GpuTemp -and $s.GpuTemp -ge $LIM.EmergGpu)) { $quentes++ } else { $quentes = 0 }
             if ($quentes -ge 3) {
                 $reg.Situacao = 'Abortada'
@@ -820,7 +838,7 @@ function Invoke-Fase {
             }
             if (Test-TeclaPular) { $reg.Situacao = 'Pulada pelo usuário'; break }
             $espera = [int](2000 - ((Get-Date) - $s.Hora).TotalMilliseconds)
-            if ($espera -gt 50) { Start-Sleep -Milliseconds $espera }
+            if ($espera -gt 50) { Wait-Ms $espera }
         }
     } finally {
         & $Parar
@@ -1617,6 +1635,7 @@ function New-Relatorio {
     if ($nCrit) { $veredito = "PROBLEMAS ENCONTRADOS: $nCrit crítico(s), $nAt ponto(s) de atenção"; $vcls = 'crit' }
     elseif ($nAt) { $veredito = "$nAt ponto(s) de atenção - nenhum problema crítico"; $vcls = 'aten' }
     else { $veredito = 'Nenhum problema encontrado'; $vcls = 'ok' }
+    $script:Veredito = $veredito; $script:VereditoCls = $vcls
     $dur = Format-Duracao ((Get-Date) - $script:InicioGeral).TotalSeconds
     $rotulo = @{ CRITICO = 'CRÍTICO'; ATENCAO = 'ATENÇÃO'; INFO = 'INFO'; OK = 'OK' }
 
@@ -1752,6 +1771,9 @@ function Show-Banner {
     Write-Host ''
 }
 
+# ---------------------------------------------------------------------------
+#  Plano de testes
+# ---------------------------------------------------------------------------
 function Read-SimNao([string]$p, [bool]$padrao = $true) {
     $sufixo = $(if ($padrao) { '[S/n]' } else { '[s/N]' })
     $r = Read-Host "   $p $sufixo"
@@ -1759,252 +1781,570 @@ function Read-SimNao([string]$p, [bool]$padrao = $true) {
     return ($r -match '^[sSyY]')
 }
 
-Show-Banner
-if (-not $Modo) {
-    Write-Host '   Escolha o modo:' -ForegroundColor White
-    Write-Host '   [1] Rápido       ~10 min  (triagem)'
-    Write-Host '   [2] Completo     ~30 min  (recomendado para "desliga sozinho" / "trava")'
-    Write-Host '   [3] Personalizado         (você escolhe tempo e testes)'
-    Write-Host '   [4] Só diagnóstico ~2 min (logs, SMART, inventário - sem estresse)'
-    Write-Host ''
-    $op = Read-Host '   Opção [2]'
-    switch ($op) {
-        '1' { $Modo = 'Rapido' }
-        '3' { $Modo = 'Personalizado' }
-        '4' { $Modo = 'Diagnostico' }
-        default { $Modo = 'Completo' }
+function Read-MenuConsole {
+    if (-not $script:Modo) {
+        Write-Host '   Escolha o modo:' -ForegroundColor White
+        Write-Host '   [1] Rápido       ~10 min  (triagem)'
+        Write-Host '   [2] Completo     ~30 min  (recomendado para "desliga sozinho" / "trava")'
+        Write-Host '   [3] Personalizado         (você escolhe tempo e testes)'
+        Write-Host '   [4] Só diagnóstico ~2 min (logs, SMART, inventário - sem estresse)'
+        Write-Host ''
+        $op = Read-Host '   Opção [2]'
+        switch ($op) {
+            '1' { $script:Modo = 'Rapido' }
+            '3' { $script:Modo = 'Personalizado' }
+            '4' { $script:Modo = 'Diagnostico' }
+            default { $script:Modo = 'Completo' }
+        }
     }
-}
-$tamDiscoMB = 4096
-switch ($Modo) {
-    'Rapido' { if (-not $Minutos) { $Minutos = 10 }; $tamDiscoMB = 1024 }
-    'Completo' { if (-not $Minutos) { $Minutos = 30 }; $tamDiscoMB = 4096 }
-    'Diagnostico' { $Minutos = 2; $SemCPU = $true; $SemRAM = $true; $SemDisco = $true; $SemGPU = $true }
-    'Personalizado' {
-        if (-not $Minutos) {
+    if ($script:Modo -eq 'Personalizado') {
+        if (-not $script:Minutos) {
             $m = Read-Host '   Duração total em minutos [45]'
-            $Minutos = 45; if ($m -match '^\d+$' -and [int]$m -ge 5) { $Minutos = [int]$m }
+            $script:MinutosEscolhido = 45; if ($m -match '^\d+$' -and [int]$m -ge 5) { $script:MinutosEscolhido = [int]$m }
         }
-        if (-not $PSBoundParameters.ContainsKey('SemRAM')) { $SemRAM = -not (Read-SimNao 'Testar memória RAM?') }
-        if (-not $PSBoundParameters.ContainsKey('SemCPU')) { $SemCPU = -not (Read-SimNao 'Estresse do processador?') }
-        if (-not $PSBoundParameters.ContainsKey('SemGPU')) { $SemGPU = -not (Read-SimNao 'Estresse da placa de vídeo?') }
-        if (-not $PSBoundParameters.ContainsKey('SemDisco')) { $SemDisco = -not (Read-SimNao 'Teste de gravação/leitura do SSD/HD?') }
-        $tamDiscoMB = [Math]::Min(8192, [Math]::Max(1024, $Minutos * 100))
+        if (-not $script:ParamsOriginais.ContainsKey('SemRAM')) { $script:SemRAM = [switch](-not (Read-SimNao 'Testar memória RAM?')) }
+        if (-not $script:ParamsOriginais.ContainsKey('SemCPU')) { $script:SemCPU = [switch](-not (Read-SimNao 'Estresse do processador?')) }
+        if (-not $script:ParamsOriginais.ContainsKey('SemGPU')) { $script:SemGPU = [switch](-not (Read-SimNao 'Estresse da placa de vídeo?')) }
+        if (-not $script:ParamsOriginais.ContainsKey('SemDisco')) { $script:SemDisco = [switch](-not (Read-SimNao 'Teste de gravação/leitura do SSD/HD?')) }
     }
 }
 
-# Distribuição do tempo
-$tempoFixo = 30 + 90 + $(if ($SemDisco) { 0 } else { [int]($tamDiscoMB / 30) })
-$orcamento = [Math]::Max(240, $Minutos * 60 - $tempoFixo)
-$pesos = [ordered]@{}
-if (-not $SemRAM) { $pesos.RAM = 0.30 }
-if (-not $SemCPU) { $pesos.CPU = 0.25 }
-if (-not $SemGPU) { $pesos.GPU = 0.25 }
-if (-not $SemCPU -and -not $SemGPU) { $pesos.Combo = 0.20 }
-$somaPesos = ($pesos.Values | Measure-Object -Sum).Sum
-$tempos = @{}
-foreach ($k in $pesos.Keys) { $tempos[$k] = [int]($orcamento * $pesos[$k] / $somaPesos) }
+function Initialize-Plano {
+    $script:tamDiscoMB = 4096
+    $min = $script:MinutosEscolhido
+    if (-not $min) { $min = $script:Minutos }
+    switch ($script:Modo) {
+        'Rapido' { if (-not $min) { $min = 10 }; $script:tamDiscoMB = 1024 }
+        'Completo' { if (-not $min) { $min = 30 }; $script:tamDiscoMB = 4096 }
+        'Diagnostico' { $min = 2; $script:SemCPU = $true; $script:SemRAM = $true; $script:SemDisco = $true; $script:SemGPU = $true }
+        'Personalizado' { if (-not $min) { $min = 45 }; $script:tamDiscoMB = [Math]::Min(8192, [Math]::Max(1024, $min * 100)) }
+    }
+    $script:MinutosPlano = $min
+    $tempoFixo = 30 + 90 + $(if ($script:SemDisco) { 0 } else { [int]($script:tamDiscoMB / 30) })
+    $orcamento = [Math]::Max(240, $min * 60 - $tempoFixo)
+    $script:pesos = [ordered]@{}
+    if (-not $script:SemRAM) { $script:pesos.RAM = 0.30 }
+    if (-not $script:SemCPU) { $script:pesos.CPU = 0.25 }
+    if (-not $script:SemGPU) { $script:pesos.GPU = 0.25 }
+    if (-not $script:SemCPU -and -not $script:SemGPU) { $script:pesos.Combo = 0.20 }
+    $somaPesos = ($script:pesos.Values | Measure-Object -Sum).Sum
+    $script:tempos = @{}
+    foreach ($k in $script:pesos.Keys) { $script:tempos[$k] = [int]($orcamento * $script:pesos[$k] / $somaPesos) }
 
-$planos = @()
-if (-not $SemDisco) { $planos += "SSD/HD ($tamDiscoMB MB)" }
-foreach ($k in $pesos.Keys) { $planos += '{0} {1}' -f @{ RAM = 'RAM'; CPU = 'CPU'; GPU = 'GPU'; Combo = 'CPU+GPU' }[$k], (Format-Duracao $tempos[$k]) }
-Write-Host ''
-Write-Host "   Modo: $Modo  |  Testes: $(if ($planos) { $planos -join ', ' } else { 'nenhum estresse' })" -ForegroundColor White
-Write-Host '   Feche os programas abertos. Não use o PC durante o teste. Notebook: deixe na TOMADA.' -ForegroundColor Yellow
-Write-Host '   Se o PC desligar sozinho no meio do teste, ligue e rode o DiagPC de novo: ele vai registrar isso.' -ForegroundColor Yellow
-Write-Host ''
+    $planos = @()
+    if (-not $script:SemDisco) { $planos += "SSD/HD ($($script:tamDiscoMB) MB)" }
+    foreach ($k in $script:pesos.Keys) { $planos += '{0} {1}' -f @{ RAM = 'RAM'; CPU = 'CPU'; GPU = 'GPU'; Combo = 'CPU+GPU' }[$k], (Format-Duracao $script:tempos[$k]) }
+    Write-Host ''
+    Write-Host "   Modo: $($script:Modo)  |  Testes: $(if ($planos) { $planos -join ', ' } else { 'nenhum estresse' })" -ForegroundColor White
+    Write-Host '   Feche os programas abertos. Não use o PC durante o teste. Notebook: deixe na TOMADA.' -ForegroundColor Yellow
+    Write-Host '   Se o PC desligar sozinho no meio do teste, ligue e rode o DiagPC de novo: ele vai registrar isso.' -ForegroundColor Yellow
+    Write-Host ''
+}
+
+function Reset-Estado {
+    $script:PastaRel = Join-Path $RelRoot ('{0}_{1:yyyy-MM-dd_HH-mm-ss}' -f $env:COMPUTERNAME, (Get-Date))
+    New-Item -ItemType Directory -Path $script:PastaRel -Force | Out-Null
+    $script:ArqCsv = Join-Path $script:PastaRel 'amostras_sensores.csv'
+    $script:ArqHtml = Join-Path $script:PastaRel 'relatorio.html'
+    $script:ArqTxt = Join-Path $script:PastaRel 'resumo.txt'
+    $script:Achados = New-Object System.Collections.Generic.List[object]
+    $script:Amostras = New-Object System.Collections.Generic.List[object]
+    $script:Fases = New-Object System.Collections.Generic.List[object]
+    $script:Eventos = New-Object System.Collections.Generic.List[object]
+    $script:Discos = New-Object System.Collections.Generic.List[object]
+    $script:Conclusoes = New-Object System.Collections.Generic.List[string]
+    $script:Inv = [ordered]@{}
+    $script:Flags = @{}
+    $script:FaseAtual = 'Início'
+    $script:InicioGeral = Get-Date
+    $script:InicioTestes = $null
+    $script:MaxCpu = $null; $script:MaxGpu = $null
+    $script:LHM = $null; $script:LHMErro = ''
+    $script:GpuAtivo = $false; $script:okGpuIni = $false
+    $script:CsvIniciado = $false; $script:Concluido = $false
+    $script:EhNotebook = $false; $script:FonteTempCpu = ''; $script:SemAcpi = $false
+    $script:PularSolicitado = $false; $script:CancelarSolicitado = $false
+    $script:Modulos = $null; $script:Gpus = $null
+}
+
+function Test-Cancelado { if ($script:CancelarSolicitado) { throw 'Teste interrompido pelo usuário' } }
+
+function Wait-Ms([int]$ms) {
+    if ($ms -le 0) { return }
+    if ($script:Gui) {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt $ms) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($script:CancelarSolicitado -or $script:PularSolicitado) { break }
+            Start-Sleep -Milliseconds 30
+        }
+    } else { Start-Sleep -Milliseconds $ms }
+}
 
 # ---------------------------------------------------------------------------
-#  Execução
+#  Execução dos testes
 # ---------------------------------------------------------------------------
-[DiagSys]::DesativarQuickEdit()
-$nThreads = [Environment]::ProcessorCount
+function Start-Diagnostico {
+    Reset-Estado
+    Initialize-Plano
+    $nThreads = [Environment]::ProcessorCount
+    $tamDiscoMB = $script:tamDiscoMB; $tempos = $script:tempos; $pesos = $script:pesos
+    $Modo = $script:Modo; $SemCPU = $script:SemCPU; $SemRAM = $script:SemRAM; $SemGPU = $script:SemGPU; $SemDisco = $script:SemDisco
+    $DiasLogs = $script:DiasLogs
+    try {
+        Test-ExecucaoAnterior
+        Save-Estado 'Rodando'
+        [DiagSys]::ManterAcordado($true)
+        Initialize-Sensores
 
-try {
-    Test-ExecucaoAnterior
-    Save-Estado 'Rodando'
-    [DiagSys]::ManterAcordado($true)
-    Initialize-Sensores
+        Invoke-Fase -Nome 'Repouso' -Segundos $(if ($Modo -eq 'Diagnostico') { 15 } else { 30 })
+        $st = Get-StatsFase 'Repouso'
+        if ($null -ne $st.CpuTempMed) {
+            if ($st.CpuTempMed -ge $LIM.CpuRepousoCritico) { $script:Flags.CpuQuente = $true; Add-Achado CRITICO 'Temperatura' ('Processador muito quente EM REPOUSO: {0:N0} °C' -f $st.CpuTempMed) 'Cooler parado/solto, pasta térmica seca ou poeira acumulada.' }
+            elseif ($st.CpuTempMed -ge $LIM.CpuRepousoAtencao) { $script:Flags.CpuMorno = $true; Add-Achado ATENCAO 'Temperatura' ('Processador quente em repouso: {0:N0} °C' -f $st.CpuTempMed) 'O normal em repouso é 30-55 °C (notebooks até ~60 °C).' }
+            else { Add-Achado OK 'Temperatura' ('Processador em repouso: {0:N0} °C' -f $st.CpuTempMed) $(if ($script:FonteTempCpu -like '*ACPI*') { 'Leitura pela zona térmica ACPI (aproximada).' } else { '' }) }
+        } else {
+            $motivoT = $(if ($script:LHM) { 'O LibreHardwareMonitor carregou, mas o driver de leitura da CPU (WinRing0) provavelmente foi bloqueado pelo Windows (lista de drivers vulneráveis / Integridade de Memória) ou pelo antivírus. GPU e discos continuam sendo lidos.' } else { "Sensor indisponível ($($script:LHMErro))." })
+            Add-Achado INFO 'Temperatura' 'Não foi possível ler a temperatura do processador' $motivoT
+        }
+        if ($null -ne $st.GpuTempMed -and $st.GpuTempMed -ge 70) { Add-Achado ATENCAO 'Temperatura' ('Placa de vídeo quente em repouso: {0:N0} °C' -f $st.GpuTempMed) 'Ventoinhas da placa podem estar paradas/sujas.' }
+        if ($null -ne $st.CpuLoadMed -and $st.CpuLoadMed -ge 30) {
+            $top = (Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $_.ProcessName }) -join ', '
+            Add-Achado ATENCAO 'Desempenho' ('Processador {0:N0}% ocupado em repouso' -f $st.CpuLoadMed) "Algo está consumindo CPU em segundo plano (processos com mais CPU acumulada: $top). Pode ser atualização do Windows, antivírus ou malware."
+        }
 
-    Invoke-Fase -Nome 'Repouso' -Segundos $(if ($Modo -eq 'Diagnostico') { 15 } else { 30 })
-    $st = Get-StatsFase 'Repouso'
-    if ($null -ne $st.CpuTempMed) {
-        if ($st.CpuTempMed -ge $LIM.CpuRepousoCritico) { $script:Flags.CpuQuente = $true; Add-Achado CRITICO 'Temperatura' ('Processador muito quente EM REPOUSO: {0:N0} °C' -f $st.CpuTempMed) 'Cooler parado/solto, pasta térmica seca ou poeira acumulada.' }
-        elseif ($st.CpuTempMed -ge $LIM.CpuRepousoAtencao) { $script:Flags.CpuMorno = $true; Add-Achado ATENCAO 'Temperatura' ('Processador quente em repouso: {0:N0} °C' -f $st.CpuTempMed) 'O normal em repouso é 30-55 °C (notebooks até ~60 °C).' }
-        else { Add-Achado OK 'Temperatura' ('Processador em repouso: {0:N0} °C' -f $st.CpuTempMed) $(if ($script:FonteTempCpu -like '*ACPI*') { 'Leitura pela zona térmica ACPI (aproximada).' } else { '' }) }
-    } else {
-        $motivoT = $(if ($script:LHM) { 'O LibreHardwareMonitor carregou, mas o driver de leitura da CPU (WinRing0) provavelmente foi bloqueado pelo Windows (lista de drivers vulneráveis / Integridade de Memória) ou pelo antivírus. GPU e discos continuam sendo lidos.' } else { "Sensor indisponível ($($script:LHMErro))." })
-        Add-Achado INFO 'Temperatura' 'Não foi possível ler a temperatura do processador' $motivoT
-    }
-    if ($null -ne $st.GpuTempMed -and $st.GpuTempMed -ge 70) { Add-Achado ATENCAO 'Temperatura' ('Placa de vídeo quente em repouso: {0:N0} °C' -f $st.GpuTempMed) 'Ventoinhas da placa podem estar paradas/sujas.' }
-    if ($null -ne $st.CpuLoadMed -and $st.CpuLoadMed -ge 30) {
-        $top = (Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $_.ProcessName }) -join ', '
-        Add-Achado ATENCAO 'Desempenho' ('Processador {0:N0}% ocupado em repouso' -f $st.CpuLoadMed) "Algo está consumindo CPU em segundo plano (processos com mais CPU acumulada: $top). Pode ser atualização do Windows, antivírus ou malware."
-    }
+        Test-Cancelado
+        Invoke-Seguro 'Informações do computador' { Get-Inventario }
+        Invoke-Seguro 'Logs do Windows' { Get-AnaliseEventos }
+        Invoke-Seguro 'Saúde dos discos' { Get-SaudeArmazenamento }
+        Test-Cancelado
+        $script:InicioTestes = Get-Date
 
-    Invoke-Seguro 'Informações do computador' { Get-Inventario }
-    Invoke-Seguro 'Logs do Windows' { Get-AnaliseEventos }
-    Invoke-Seguro 'Saúde dos discos' { Get-SaudeArmazenamento }
-    $script:InicioTestes = Get-Date
-
-    # --- Disco ---
-    if (-not $SemDisco) {
-        $vol = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'"
-        $livreMB = [int64]($vol.FreeSpace / 1MB)
-        $tam = [int64][Math]::Min($tamDiscoMB, ($livreMB - 3072) * 0.5)
-        $tam = [int64]([Math]::Floor($tam / 4) * 4)
-        if ($tam -ge 256) {
-            $arqTeste = Join-Path $env:SystemDrive 'diagpc_teste_disco.tmp'
-            Invoke-Fase -Nome 'Teste de SSD/HD' -Segundos 1800 `
-                -Iniciar { [DiagDisk]::Start($arqTeste, $tam) } `
-                -Terminou { [DiagDisk]::Done } `
-                -Parar { if (-not [DiagDisk]::Done) { [DiagDisk]::Stop() } } `
-                -Status { '{0} {1}/{2} MB' -f [DiagDisk]::Etapa, [DiagDisk]::DoneMB, [DiagDisk]::TotalMB }
-            $w = [DiagDisk]::WriteMBps; $r = [DiagDisk]::ReadMBps
-            $script:Inv['Velocidade do disco (teste)'] = 'gravação {0:N0} MB/s, leitura {1:N0} MB/s ({2} MB)' -f $w, $r, [DiagDisk]::WrittenMB
-            if ([DiagDisk]::IoErrors -gt 0 -or [DiagDisk]::Mismatches -gt 0) {
-                $script:Flags.DiscoErros = $true
-                Add-Achado CRITICO 'Teste de disco' 'FALHA no teste de gravação/leitura do disco' ("{0}. {1} bloco(s) de dados corrompidos. Disco, cabo ou controlador com defeito (ou RAM instável)." -f [DiagDisk]::Error, [DiagDisk]::Mismatches)
-            } elseif ([DiagDisk]::SetupFailed) {
-                Add-Achado INFO 'Teste de disco' 'Teste de disco não pôde ser executado' ([DiagDisk]::Error)
-            } elseif ([DiagDisk]::WrittenMB -gt 0) {
-                $sysPd = $null
-                try { $num = (Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')).DiskNumber; $sysPd = Get-PhysicalDisk | Where-Object { "$($_.DeviceId)" -eq "$num" } } catch {}
-                $ehSsd = ($sysPd -and "$($sysPd.MediaType)" -eq 'SSD')
-                $txtV = 'Gravação {0:N0} MB/s, leitura {1:N0} MB/s, {2} MB verificados sem erro' -f $w, $r, [DiagDisk]::WrittenMB
-                if ($ehSsd -and ($w -lt 80 -or $r -lt 150)) { Add-Achado ATENCAO 'Teste de disco' "SSD lento: $txtV" 'Para SSD o esperado é acima de ~300 MB/s (SATA) ou ~1000 MB/s (NVMe). Causas: SSD cheio, sem cache/QLC saturado, modo IDE na BIOS, desgaste ou superaquecimento.' }
-                elseif (-not $ehSsd -and $r -lt 50) { Add-Achado ATENCAO 'Teste de disco' "Disco muito lento: $txtV" 'HD mecânico desgastado ou com setores ruins.' }
-                else { Add-Achado OK 'Teste de disco' $txtV }
-            }
-            $st = Get-StatsFase 'Teste de SSD/HD'
-            if ($null -ne $st.DiscoTempMax -and $st.DiscoTempMax -ge 75) { Add-Achado ATENCAO 'Temperatura' ('SSD/HD chegou a {0:N0} °C durante o teste' -f $st.DiscoTempMax) 'SSD NVMe acima de ~75 °C reduz velocidade (throttling). Dissipador ou ventilação.' }
-
-            try {
-                Write-Host '   Verificando sistema de arquivos (sem alterar nada)...' -ForegroundColor Gray
-                $letra = $env:SystemDrive.TrimEnd(':')
-                $job = Start-Job -ScriptBlock { param($l) (Repair-Volume -DriveLetter $l -Scan -ErrorAction Stop).ToString() } -ArgumentList $letra
-                if (Wait-Job $job -Timeout 300) {
-                    $res = "$(Receive-Job $job -ErrorAction SilentlyContinue)"
-                    if ($res -and $res -ne 'NoErrorsFound') {
-                        Add-Achado ATENCAO 'Sistema de arquivos' "Sistema de arquivos com problemas ($res)" "Rode 'chkdsk $($env:SystemDrive) /f' e reinicie."
-                    } elseif ($res) { Add-Achado OK 'Sistema de arquivos' 'Sistema de arquivos sem erros' }
+        # --- Disco ---
+        if (-not $SemDisco) {
+            $vol = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'"
+            $livreMB = [int64]($vol.FreeSpace / 1MB)
+            $tam = [int64][Math]::Min($tamDiscoMB, ($livreMB - 3072) * 0.5)
+            $tam = [int64]([Math]::Floor($tam / 4) * 4)
+            if ($tam -ge 256) {
+                $arqTeste = Join-Path $env:SystemDrive 'diagpc_teste_disco.tmp'
+                Invoke-Fase -Nome 'Teste de SSD/HD' -Segundos 1800 `
+                    -Iniciar { [DiagDisk]::Start($arqTeste, $tam) } `
+                    -Terminou { [DiagDisk]::Done } `
+                    -Parar { if (-not [DiagDisk]::Done) { [DiagDisk]::Stop() } } `
+                    -Status { '{0} {1}/{2} MB' -f [DiagDisk]::Etapa, [DiagDisk]::DoneMB, [DiagDisk]::TotalMB }
+                $w = [DiagDisk]::WriteMBps; $r = [DiagDisk]::ReadMBps
+                $script:Inv['Velocidade do disco (teste)'] = 'gravação {0:N0} MB/s, leitura {1:N0} MB/s ({2} MB)' -f $w, $r, [DiagDisk]::WrittenMB
+                if ([DiagDisk]::IoErrors -gt 0 -or [DiagDisk]::Mismatches -gt 0) {
+                    $script:Flags.DiscoErros = $true
+                    Add-Achado CRITICO 'Teste de disco' 'FALHA no teste de gravação/leitura do disco' ("{0}. {1} bloco(s) de dados corrompidos. Disco, cabo ou controlador com defeito (ou RAM instável)." -f [DiagDisk]::Error, [DiagDisk]::Mismatches)
+                } elseif ([DiagDisk]::SetupFailed) {
+                    Add-Achado INFO 'Teste de disco' 'Teste de disco não pôde ser executado' ([DiagDisk]::Error)
+                } elseif ([DiagDisk]::WrittenMB -gt 0) {
+                    $sysPd = $null
+                    try { $num = (Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')).DiskNumber; $sysPd = Get-PhysicalDisk | Where-Object { "$($_.DeviceId)" -eq "$num" } } catch {}
+                    $ehSsd = ($sysPd -and "$($sysPd.MediaType)" -eq 'SSD')
+                    $txtV = 'Gravação {0:N0} MB/s, leitura {1:N0} MB/s, {2} MB verificados sem erro' -f $w, $r, [DiagDisk]::WrittenMB
+                    if ($ehSsd -and ($w -lt 80 -or $r -lt 150)) { Add-Achado ATENCAO 'Teste de disco' "SSD lento: $txtV" 'Para SSD o esperado é acima de ~300 MB/s (SATA) ou ~1000 MB/s (NVMe). Causas: SSD cheio, sem cache/QLC saturado, modo IDE na BIOS, desgaste ou superaquecimento.' }
+                    elseif (-not $ehSsd -and $r -lt 50) { Add-Achado ATENCAO 'Teste de disco' "Disco muito lento: $txtV" 'HD mecânico desgastado ou com setores ruins.' }
+                    else { Add-Achado OK 'Teste de disco' $txtV }
                 }
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-            } catch {}
-        } else {
-            Add-Achado INFO 'Teste de disco' 'Teste de disco pulado: pouco espaço livre' ''
-        }
-    }
+                $st = Get-StatsFase 'Teste de SSD/HD'
+                if ($null -ne $st.DiscoTempMax -and $st.DiscoTempMax -ge 75) { Add-Achado ATENCAO 'Temperatura' ('SSD/HD chegou a {0:N0} °C durante o teste' -f $st.DiscoTempMax) 'SSD NVMe acima de ~75 °C reduz velocidade (throttling). Dissipador ou ventilação.' }
 
-    # --- RAM ---
-    if (-not $SemRAM) {
-        $os = Get-CimInstance Win32_OperatingSystem
-        $livreMB = [int64]($os.FreePhysicalMemory / 1KB)
-        $alvo = [int64]($livreMB * 0.75) - 512
-        if (-not [Environment]::Is64BitProcess) { $alvo = [Math]::Min($alvo, 1200) }
-        $totalMB = [int64]($os.TotalVisibleMemorySize / 1KB)
-        if ($alvo -ge 256) {
-            Invoke-Fase -Nome 'Teste de memória RAM' -Segundos $tempos.RAM `
-                -Iniciar { Write-Host '   Reservando memória...' -ForegroundColor Gray; [void][DiagMem]::Allocate($alvo); [DiagMem]::Start($nThreads) } `
-                -Parar { [DiagMem]::Free() } `
-                -Status { 'RAM {0:N1}GB passada {1} erros {2}' -f ([DiagMem]::AllocatedMB / 1024), [DiagMem]::Passes, [DiagMem]::Errors }
-            $alocGB = '{0:N1} GB' -f ($alvo / 1024)
-            $pct = $alvo / $totalMB * 100
-            if ([DiagMem]::Errors -gt 0) {
-                $script:Flags.RamErros = $true
-                Add-Achado CRITICO 'Memória RAM' ('ERROS DE MEMÓRIA: {0} erro(s) encontrados no teste' -f [DiagMem]::Errors) ("Primeiro erro: {0}. Pente de memória com defeito, mal encaixado, XMP/overclock instável ou slot/placa-mãe. Teste um pente por vez." -f [DiagMem]::FirstError)
-            } elseif ([DiagMem]::VerifiedMB -gt 0) {
-                Add-Achado OK 'Memória RAM' ('Teste de memória sem erros ({0} testados, ~{1:N0}% da RAM, {2:N0} GB verificados)' -f $alocGB, $pct, ([DiagMem]::VerifiedMB / 1024)) 'Para cobrir 100% da memória, use MemTest86 em pendrive.'
-            }
-        } else {
-            Add-Achado INFO 'Memória RAM' 'Teste de RAM pulado: pouca memória livre' ''
-        }
-    }
-
-    # --- CPU ---
-    if (-not $SemCPU) {
-        Invoke-Fase -Nome 'Estresse do processador' -Segundos $tempos.CPU `
-            -Iniciar { [DiagCpu]::Start($nThreads) } -Parar { [DiagCpu]::Stop() } `
-            -Status { 'cálculos {0:N0} erros {1}' -f [DiagCpu]::Iterations, [DiagCpu]::Errors }
-        $st = Get-StatsFase 'Estresse do processador'
-        if ([DiagCpu]::Errors -gt 0) {
-            $script:Flags.CpuErros = $true
-            Add-Achado CRITICO 'Processador' ('O processador ERROU {0} cálculo(s) sob carga' -f [DiagCpu]::Errors) 'Instabilidade: overclock/undervolt, tensão, superaquecimento, fonte ou CPU/placa-mãe com defeito.'
-        } else {
-            Add-Achado OK 'Processador' ('Estresse do processador sem erros de cálculo ({0:N0} verificações)' -f [DiagCpu]::Iterations)
-        }
-        Test-TempCpu $st.CpuTempMax 'sob carga máxima'
-        Test-Throttling 'Estresse do processador'
-        if ($null -ne $st.CpuPowerMax) { $script:Inv['Consumo da CPU (máx.)'] = '{0:N0} W' -f $st.CpuPowerMax }
-    }
-
-    # --- GPU ---
-    if (-not $SemGPU) {
-        $okGpu = $false
-        Invoke-Fase -Nome 'Estresse da placa de vídeo' -Segundos $tempos.GPU `
-            -Iniciar { $script:okGpuIni = Start-GpuStress $tempos.GPU; if ($script:okGpuIni) { Start-Sleep 4 } } `
-            -Parar { Stop-GpuStress } `
-            -Terminou { -not $script:okGpuIni } `
-            -Status { if ($script:GpuFalhaMsg) { 'FALHA' } else { 'teste WebGL' } }
-        $okGpu = $script:okGpuIni
-        if (-not $okGpu) {
-            Add-Achado INFO 'Placa de vídeo' 'Teste de GPU não executado: Edge/Chrome não encontrado' ''
-        } else {
-            $st = Get-StatsFase 'Estresse da placa de vídeo'
-            if ($script:GpuFalhaMsg) {
-                $script:Flags.GpuFalhou = $true
-                Add-Achado CRITICO 'Placa de vídeo' 'A placa de vídeo FALHOU durante o teste' $script:GpuFalhaMsg
-            } elseif ($null -eq $script:GpuTitulo) {
-                Add-Achado INFO 'Placa de vídeo' 'Não foi possível confirmar se o teste de GPU rodou' 'A janela do teste não foi identificada.'
+                try {
+                    Write-Host '   Verificando sistema de arquivos (sem alterar nada)...' -ForegroundColor Gray
+                    $letra = $env:SystemDrive.TrimEnd(':')
+                    $job = Start-Job -ScriptBlock { param($l) (Repair-Volume -DriveLetter $l -Scan -ErrorAction Stop).ToString() } -ArgumentList $letra
+                    $limJob = (Get-Date).AddSeconds(300)
+                    while ($job.State -eq 'Running' -and (Get-Date) -lt $limJob -and -not $script:CancelarSolicitado) { Wait-Ms 500 }
+                    if ($job.State -eq 'Completed') {
+                        $res = "$(Receive-Job $job -ErrorAction SilentlyContinue)"
+                        if ($res -and $res -ne 'NoErrorsFound') {
+                            Add-Achado ATENCAO 'Sistema de arquivos' "Sistema de arquivos com problemas ($res)" "Rode 'chkdsk $($env:SystemDrive) /f' e reinicie."
+                        } elseif ($res) { Add-Achado OK 'Sistema de arquivos' 'Sistema de arquivos sem erros' }
+                    }
+                    Remove-Job $job -Force -ErrorAction SilentlyContinue
+                } catch {}
             } else {
-                $txt = 'Estresse da placa de vídeo concluído sem falhas'
-                if ($null -ne $st.GpuFpsMed) { $txt += (' (média {0:N0} FPS, carga {1})' -f $st.GpuFpsMed, (Fmt $st.GpuLoadMed '%')) }
-                Add-Achado OK 'Placa de vídeo' $txt
-                if ($null -ne $st.GpuLoadMed -and $st.GpuLoadMed -lt 60) {
-                    Add-Achado INFO 'Placa de vídeo' ('Carga média da GPU ficou em {0:N0}% no teste' -f $st.GpuLoadMed) 'Em notebook com duas placas o navegador pode ter usado o vídeo integrado. Para forçar a dedicada: Configurações > Sistema > Tela > Elementos gráficos > Edge > Alto desempenho.'
-                }
+                Add-Achado INFO 'Teste de disco' 'Teste de disco pulado: pouco espaço livre' ''
             }
-            Test-TempGpu $st 'sob carga máxima'
-            if ($null -eq $st.GpuTempMax) { Add-Achado INFO 'Temperatura' 'Temperatura da placa de vídeo não disponível' 'Vídeo integrado normalmente não informa temperatura separada.' }
         }
+
+        Test-Cancelado
+        # --- RAM ---
+        if (-not $SemRAM) {
+            $os = Get-CimInstance Win32_OperatingSystem
+            $livreMB = [int64]($os.FreePhysicalMemory / 1KB)
+            $alvo = [int64]($livreMB * 0.75) - 512
+            if (-not [Environment]::Is64BitProcess) { $alvo = [Math]::Min($alvo, 1200) }
+            $totalMB = [int64]($os.TotalVisibleMemorySize / 1KB)
+            if ($alvo -ge 256) {
+                Invoke-Fase -Nome 'Teste de memória RAM' -Segundos $tempos.RAM `
+                    -Iniciar { Write-Host '   Reservando memória...' -ForegroundColor Gray; [void][DiagMem]::Allocate($alvo); [DiagMem]::Start($nThreads) } `
+                    -Parar { [DiagMem]::Free() } `
+                    -Status { 'RAM {0:N1}GB passada {1} erros {2}' -f ([DiagMem]::AllocatedMB / 1024), [DiagMem]::Passes, [DiagMem]::Errors }
+                $alocGB = '{0:N1} GB' -f ($alvo / 1024)
+                $pct = $alvo / $totalMB * 100
+                if ([DiagMem]::Errors -gt 0) {
+                    $script:Flags.RamErros = $true
+                    Add-Achado CRITICO 'Memória RAM' ('ERROS DE MEMÓRIA: {0} erro(s) encontrados no teste' -f [DiagMem]::Errors) ("Primeiro erro: {0}. Pente de memória com defeito, mal encaixado, XMP/overclock instável ou slot/placa-mãe. Teste um pente por vez." -f [DiagMem]::FirstError)
+                } elseif ([DiagMem]::VerifiedMB -gt 0) {
+                    Add-Achado OK 'Memória RAM' ('Teste de memória sem erros ({0} testados, ~{1:N0}% da RAM, {2:N0} GB verificados)' -f $alocGB, $pct, ([DiagMem]::VerifiedMB / 1024)) 'Para cobrir 100% da memória, use MemTest86 em pendrive.'
+                }
+            } else {
+                Add-Achado INFO 'Memória RAM' 'Teste de RAM pulado: pouca memória livre' ''
+            }
+        }
+
+        Test-Cancelado
+        # --- CPU ---
+        if (-not $SemCPU) {
+            Invoke-Fase -Nome 'Estresse do processador' -Segundos $tempos.CPU `
+                -Iniciar { [DiagCpu]::Start($nThreads) } -Parar { [DiagCpu]::Stop() } `
+                -Status { 'cálculos {0:N0} erros {1}' -f [DiagCpu]::Iterations, [DiagCpu]::Errors }
+            $st = Get-StatsFase 'Estresse do processador'
+            if ([DiagCpu]::Errors -gt 0) {
+                $script:Flags.CpuErros = $true
+                Add-Achado CRITICO 'Processador' ('O processador ERROU {0} cálculo(s) sob carga' -f [DiagCpu]::Errors) 'Instabilidade: overclock/undervolt, tensão, superaquecimento, fonte ou CPU/placa-mãe com defeito.'
+            } else {
+                Add-Achado OK 'Processador' ('Estresse do processador sem erros de cálculo ({0:N0} verificações)' -f [DiagCpu]::Iterations)
+            }
+            Test-TempCpu $st.CpuTempMax 'sob carga máxima'
+            Test-Throttling 'Estresse do processador'
+            if ($null -ne $st.CpuPowerMax) { $script:Inv['Consumo da CPU (máx.)'] = '{0:N0} W' -f $st.CpuPowerMax }
+        }
+
+        Test-Cancelado
+        # --- GPU ---
+        if (-not $SemGPU) {
+            $okGpu = $false
+            Invoke-Fase -Nome 'Estresse da placa de vídeo' -Segundos $tempos.GPU `
+                -Iniciar { $script:okGpuIni = Start-GpuStress $tempos.GPU; if ($script:okGpuIni) { Wait-Ms 4000 } } `
+                -Parar { Stop-GpuStress } `
+                -Terminou { -not $script:okGpuIni } `
+                -Status { if ($script:GpuFalhaMsg) { 'FALHA' } else { 'teste WebGL' } }
+            $okGpu = $script:okGpuIni
+            if (-not $okGpu) {
+                Add-Achado INFO 'Placa de vídeo' 'Teste de GPU não executado: Edge/Chrome não encontrado' ''
+            } else {
+                $st = Get-StatsFase 'Estresse da placa de vídeo'
+                if ($script:GpuFalhaMsg) {
+                    $script:Flags.GpuFalhou = $true
+                    Add-Achado CRITICO 'Placa de vídeo' 'A placa de vídeo FALHOU durante o teste' $script:GpuFalhaMsg
+                } elseif ($null -eq $script:GpuTitulo) {
+                    Add-Achado INFO 'Placa de vídeo' 'Não foi possível confirmar se o teste de GPU rodou' 'A janela do teste não foi identificada.'
+                } else {
+                    $txt = 'Estresse da placa de vídeo concluído sem falhas'
+                    if ($null -ne $st.GpuFpsMed) { $txt += (' (média {0:N0} FPS, carga {1})' -f $st.GpuFpsMed, (Fmt $st.GpuLoadMed '%')) }
+                    Add-Achado OK 'Placa de vídeo' $txt
+                    if ($null -ne $st.GpuLoadMed -and $st.GpuLoadMed -lt 60) {
+                        Add-Achado INFO 'Placa de vídeo' ('Carga média da GPU ficou em {0:N0}% no teste' -f $st.GpuLoadMed) 'Em notebook com duas placas o navegador pode ter usado o vídeo integrado. Para forçar a dedicada: Configurações > Sistema > Tela > Elementos gráficos > Edge > Alto desempenho.'
+                    }
+                }
+                Test-TempGpu $st 'sob carga máxima'
+                if ($null -eq $st.GpuTempMax) { Add-Achado INFO 'Temperatura' 'Temperatura da placa de vídeo não disponível' 'Vídeo integrado normalmente não informa temperatura separada.' }
+            }
+        }
+
+        Test-Cancelado
+        # --- Combinado ---
+        if ($pesos.Contains('Combo') -and $script:okGpuIni) {
+            Invoke-Fase -Nome 'Teste combinado CPU+GPU' -Segundos $tempos.Combo `
+                -Iniciar { [DiagCpu]::Start($nThreads); [void](Start-GpuStress $tempos.Combo); Wait-Ms 3000 } `
+                -Parar { [DiagCpu]::Stop(); Stop-GpuStress } `
+                -Status { 'erros CPU {0}' -f [DiagCpu]::Errors }
+            $st = Get-StatsFase 'Teste combinado CPU+GPU'
+            $f = $script:Fases[$script:Fases.Count - 1]
+            if ([DiagCpu]::Errors -gt 0) {
+                $script:Flags.CpuErros = $true
+                Add-Achado CRITICO 'Processador' ('Erros de cálculo no teste combinado: {0}' -f [DiagCpu]::Errors) 'Instável com carga total do sistema: suspeita de fonte ou tensão.'
+            }
+            Test-TempCpu $st.CpuTempMax 'no teste combinado'
+            Test-TempGpu $st 'no teste combinado'
+            if ($f.Situacao -eq 'Concluída') {
+                $pot = ''
+                if ($null -ne $st.CpuPowerMax -or $null -ne $st.GpuPowerMax) { $pot = 'Consumo medido: CPU {0}, GPU {1}.' -f (Fmt $st.CpuPowerMax ' W'), (Fmt $st.GpuPowerMax ' W') }
+                Add-Achado OK 'Energia' ('O sistema aguentou CPU + GPU em carga máxima por {0} sem desligar' -f (Format-Duracao ($f.Fim - $f.Inicio).TotalSeconds)) "$pot Bom sinal para a fonte (não descarta falha intermitente)."
+            }
+        }
+
+        Test-Cancelado
+        Invoke-Seguro 'Eventos durante o teste' { Test-EventosDuranteTeste }
+        $script:Concluido = $true
+    }
+    finally {
+        try { [DiagCpu]::Stop() } catch {}
+        try { [DiagMem]::Free() } catch {}
+        try { [DiagDisk]::Stop() } catch {}
+        try { Stop-GpuStress } catch {}
+        try { [DiagSys]::ManterAcordado($false) } catch {}
+        try { if ($script:LHM) { $script:LHM.Close() } } catch {}
+        if (-not $script:Concluido) { Add-Achado INFO 'Execução' $(if ($script:CancelarSolicitado) { 'Teste interrompido pelo usuário - relatório parcial' } else { 'Teste interrompido antes do fim - relatório parcial' }) '' }
+        try { Get-Conclusoes; New-Relatorio } catch { Write-Host "Erro ao gerar relatório: $($_.Exception.Message)" -ForegroundColor Red }
+        Save-Estado $(if ($script:Concluido) { 'Concluido' } else { 'Interrompido' })
+        if (-not $NaoAbrir -and (Test-Path $ArqHtml)) { Start-Process $ArqHtml }
     }
 
-    # --- Combinado ---
-    if ($pesos.Contains('Combo') -and $script:okGpuIni) {
-        Invoke-Fase -Nome 'Teste combinado CPU+GPU' -Segundos $tempos.Combo `
-            -Iniciar { [DiagCpu]::Start($nThreads); [void](Start-GpuStress $tempos.Combo); Start-Sleep 3 } `
-            -Parar { [DiagCpu]::Stop(); Stop-GpuStress } `
-            -Status { 'erros CPU {0}' -f [DiagCpu]::Errors }
-        $st = Get-StatsFase 'Teste combinado CPU+GPU'
-        $f = $script:Fases[$script:Fases.Count - 1]
-        if ([DiagCpu]::Errors -gt 0) {
-            $script:Flags.CpuErros = $true
-            Add-Achado CRITICO 'Processador' ('Erros de cálculo no teste combinado: {0}' -f [DiagCpu]::Errors) 'Instável com carga total do sistema: suspeita de fonte ou tensão.'
-        }
-        Test-TempCpu $st.CpuTempMax 'no teste combinado'
-        Test-TempGpu $st 'no teste combinado'
-        if ($f.Situacao -eq 'Concluída') {
-            $pot = ''
-            if ($null -ne $st.CpuPowerMax -or $null -ne $st.GpuPowerMax) { $pot = 'Consumo medido: CPU {0}, GPU {1}.' -f (Fmt $st.CpuPowerMax ' W'), (Fmt $st.GpuPowerMax ' W') }
-            Add-Achado OK 'Energia' ('O sistema aguentou CPU + GPU em carga máxima por {0} sem desligar' -f (Format-Duracao ($f.Fim - $f.Inicio).TotalSeconds)) "$pot Bom sinal para a fonte (não descarta falha intermitente)."
-        }
+}
+
+# ---------------------------------------------------------------------------
+#  Interface gráfica
+# ---------------------------------------------------------------------------
+function Get-CorGui([string]$c) {
+    switch ($c) {
+        'Red' { return [Drawing.Color]::FromArgb(255, 107, 107) }
+        'Yellow' { return [Drawing.Color]::FromArgb(255, 200, 87) }
+        'Green' { return [Drawing.Color]::FromArgb(91, 214, 122) }
+        'Cyan' { return [Drawing.Color]::FromArgb(79, 195, 247) }
+        'DarkCyan' { return [Drawing.Color]::FromArgb(110, 168, 211) }
+        'DarkGray' { return [Drawing.Color]::FromArgb(138, 147, 160) }
+        'White' { return [Drawing.Color]::White }
+        default { return [Drawing.Color]::FromArgb(200, 205, 212) }
+    }
+}
+
+function Add-GuiLog([string]$t, [string]$cor = 'Gray', [switch]$Negrito) {
+    $rt = $script:G.log
+    if (-not $rt) { return }
+    $rt.SelectionStart = $rt.TextLength
+    $rt.SelectionLength = 0
+    $rt.SelectionColor = Get-CorGui $cor
+    $rt.SelectionFont = $(if ($Negrito) { $script:G.fonteNeg } else { $script:G.fonteLog })
+    $rt.AppendText($t + "`r`n")
+    $rt.SelectionStart = $rt.TextLength
+    $rt.ScrollToCaret()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Get-CorTemp($v, $aten, $crit) {
+    if ($null -eq $v) { return Get-CorGui 'DarkGray' }
+    if ($v -ge $crit) { return Get-CorGui 'Red' }
+    if ($v -ge $aten) { return Get-CorGui 'Yellow' }
+    return Get-CorGui 'Green'
+}
+
+function Update-GuiLeitura($s, [string]$extra, [double]$resta, [double]$total) {
+    $G = $script:G
+    $G.cpuT.Text = Fmt $s.CpuTemp ' °C'
+    $G.cpuT.ForeColor = Get-CorTemp $s.CpuTemp $LIM.CpuAtencao $LIM.CpuCritico
+    $G.cpuI.Text = 'Carga {0}   {1}' -f (Fmt $s.CpuLoad '%'), $(if ($s.CpuClock) { '{0:N2} GHz' -f ($s.CpuClock / 1000) } else { '' })
+    $G.gpuT.Text = Fmt $s.GpuTemp ' °C'
+    $G.gpuT.ForeColor = Get-CorTemp $s.GpuTemp $LIM.GpuAtencao $LIM.GpuCritico
+    $G.gpuI.Text = 'Carga {0}   {1}' -f (Fmt $s.GpuLoad '%'), $(if ($null -ne $s.GpuFps) { '{0:N0} FPS' -f $s.GpuFps } else { '' })
+    $G.ramT.Text = Fmt $s.RamUso '%'
+    $G.ramI.Text = 'SSD/HD {0}' -f (Fmt $s.DiscoTemp ' °C')
+    $G.resta.Text = ('Resta {0}    {1}' -f (Format-Duracao $resta), $extra)
+    if ($total -gt 0) { $G.prog.Value = [int][Math]::Max(0, [Math]::Min(100, ($total - $resta) / $total * 100)) }
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function New-Ctl([string]$tipo, [string]$texto, [int]$x, [int]$y, [int]$w, [int]$h) {
+    $c = New-Object "System.Windows.Forms.$tipo"
+    if ($texto) { $c.Text = $texto }
+    $c.Location = New-Object Drawing.Point($x, $y)
+    $c.Size = New-Object Drawing.Size($w, $h)
+    return $c
+}
+
+function New-Card([string]$titulo, [int]$x, [int]$y) {
+    $p = New-Ctl 'Panel' '' $x $y 200 112
+    $p.BackColor = [Drawing.Color]::FromArgb(36, 39, 47)
+    $t = New-Ctl 'Label' $titulo 12 8 180 20
+    $t.ForeColor = Get-CorGui 'DarkGray'; $t.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold)
+    $v = New-Ctl 'Label' '--' 10 28 185 44
+    $v.Font = New-Object Drawing.Font('Segoe UI Semibold', 22); $v.ForeColor = Get-CorGui 'DarkGray'
+    $i = New-Ctl 'Label' '' 12 78 185 22
+    $i.ForeColor = Get-CorGui 'Gray'
+    $p.Controls.AddRange(@($t, $v, $i))
+    return @($p, $v, $i)
+}
+
+function Show-Gui {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    $script:Gui = $true
+
+    # no modo gráfico, toda mensagem de texto vai para o log da janela
+    function script:Write-Host {
+        param([Parameter(Position = 0, ValueFromPipeline = $true)]$Object, [switch]$NoNewline, $ForegroundColor, $BackgroundColor, $Separator)
+        $t = "$Object"
+        if (-not $t.Trim() -or $t.StartsWith("`r")) { return }
+        Add-GuiLog $t.TrimEnd() $(if ($ForegroundColor) { "$ForegroundColor" } else { 'Gray' })
     }
 
-    Invoke-Seguro 'Eventos durante o teste' { Test-EventosDuranteTeste }
-    $script:Concluido = $true
-}
-finally {
-    try { [DiagCpu]::Stop() } catch {}
-    try { [DiagMem]::Free() } catch {}
-    try { [DiagDisk]::Stop() } catch {}
-    try { Stop-GpuStress } catch {}
-    try { [DiagSys]::ManterAcordado($false) } catch {}
-    try { if ($script:LHM) { $script:LHM.Close() } } catch {}
-    if (-not $script:Concluido) { Add-Achado INFO 'Execução' 'Teste interrompido antes do fim - relatório parcial' '' }
-    try { Get-Conclusoes; New-Relatorio } catch { Write-Host "Erro ao gerar relatório: $($_.Exception.Message)" -ForegroundColor Red }
-    Save-Estado $(if ($script:Concluido) { 'Concluido' } else { 'Interrompido' })
-    if (-not $NaoAbrir -and (Test-Path $ArqHtml)) { Start-Process $ArqHtml }
+    $fundo = [Drawing.Color]::FromArgb(24, 26, 31)
+    $painel = [Drawing.Color]::FromArgb(31, 34, 41)
+    $azul = [Drawing.Color]::FromArgb(47, 111, 219)
+    $G = @{}
+    $script:G = $G
+    $G.fonteLog = New-Object Drawing.Font('Consolas', 9.5)
+    $G.fonteNeg = New-Object Drawing.Font('Consolas', 9.5, [Drawing.FontStyle]::Bold)
+
+    $f = New-Object Windows.Forms.Form
+    $f.Text = "DiagPC v$VersaoDiag - feito por Danilo Américo"
+    $f.ClientSize = New-Object Drawing.Size(1000, 680)
+    $f.StartPosition = 'CenterScreen'
+    $f.FormBorderStyle = 'FixedSingle'
+    $f.MaximizeBox = $false
+    $f.BackColor = $fundo
+    $f.ForeColor = Get-CorGui 'Gray'
+    $f.Font = New-Object Drawing.Font('Segoe UI', 9.5)
+    $G.f = $f
+
+    # Cabeçalho
+    $tit = New-Ctl 'Label' 'DiagPC' 22 12 200 44
+    $tit.Font = New-Object Drawing.Font('Segoe UI Semibold', 24); $tit.ForeColor = [Drawing.Color]::White
+    $sub = New-Ctl 'Label' 'Diagnóstico e teste de estresse de hardware   ·   feito por Danilo Américo' 25 56 600 22
+    $sub.ForeColor = Get-CorGui 'DarkGray'
+    $ver = New-Ctl 'Label' "versão $VersaoDiag" 820 22 160 24
+    $ver.TextAlign = 'MiddleRight'; $ver.ForeColor = Get-CorGui 'Cyan'; $ver.Font = New-Object Drawing.Font('Segoe UI Semibold', 11)
+    $pcl = New-Ctl 'Label' $env:COMPUTERNAME 700 50 280 22
+    $pcl.TextAlign = 'MiddleRight'; $pcl.ForeColor = Get-CorGui 'DarkGray'
+    $f.Controls.AddRange(@($tit, $sub, $ver, $pcl))
+
+    # Configuração
+    $cfg = New-Ctl 'Panel' '' 20 92 300 568
+    $cfg.BackColor = $painel
+    $f.Controls.Add($cfg)
+    $l = New-Ctl 'Label' 'MODO' 16 12 260 20; $l.ForeColor = Get-CorGui 'DarkGray'; $l.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold); $cfg.Controls.Add($l)
+    $G.rbR = New-Ctl 'RadioButton' 'Rápido  (~10 min)' 18 36 260 24
+    $G.rbC = New-Ctl 'RadioButton' 'Completo  (~30 min, recomendado)' 18 62 270 24
+    $G.rbP = New-Ctl 'RadioButton' 'Personalizado' 18 88 260 24
+    $G.rbD = New-Ctl 'RadioButton' 'Só diagnóstico  (~2 min, sem estresse)' 18 114 275 24
+    $G.rbC.Checked = $true
+    $cfg.Controls.AddRange(@($G.rbR, $G.rbC, $G.rbP, $G.rbD))
+
+    $l = New-Ctl 'Label' 'TESTES' 16 152 260 20; $l.ForeColor = Get-CorGui 'DarkGray'; $l.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold); $cfg.Controls.Add($l)
+    $G.ckRam = New-Ctl 'CheckBox' 'Memória RAM' 18 176 260 24
+    $G.ckCpu = New-Ctl 'CheckBox' 'Processador (estresse)' 18 202 260 24
+    $G.ckGpu = New-Ctl 'CheckBox' 'Placa de vídeo (estresse)' 18 228 260 24
+    $G.ckDisco = New-Ctl 'CheckBox' 'SSD/HD (gravação e leitura)' 18 254 260 24
+    $cfg.Controls.AddRange(@($G.ckRam, $G.ckCpu, $G.ckGpu, $G.ckDisco))
+
+    $l = New-Ctl 'Label' 'Duração (min)' 18 292 120 22; $cfg.Controls.Add($l)
+    $G.nMin = New-Ctl 'NumericUpDown' '' 180 290 90 24
+    $G.nMin.Minimum = 5; $G.nMin.Maximum = 480; $G.nMin.Value = 30
+    $l2 = New-Ctl 'Label' 'Logs analisados (dias)' 18 324 150 22; $cfg.Controls.Add($l2)
+    $G.nDias = New-Ctl 'NumericUpDown' '' 180 322 90 24
+    $G.nDias.Minimum = 1; $G.nDias.Maximum = 365; $G.nDias.Value = $script:DiasLogs
+    $cfg.Controls.AddRange(@($G.nMin, $G.nDias))
+
+    $G.btnIni = New-Ctl 'Button' 'INICIAR TESTE' 16 372 268 48
+    $G.btnIni.FlatStyle = 'Flat'; $G.btnIni.BackColor = $azul; $G.btnIni.ForeColor = [Drawing.Color]::White
+    $G.btnIni.FlatAppearance.BorderSize = 0; $G.btnIni.Font = New-Object Drawing.Font('Segoe UI Semibold', 12)
+    $G.btnPular = New-Ctl 'Button' 'Pular etapa' 16 430 130 34
+    $G.btnParar = New-Ctl 'Button' 'Parar' 154 430 130 34
+    $G.btnRel = New-Ctl 'Button' 'Abrir relatório' 16 474 130 34
+    $G.btnPasta = New-Ctl 'Button' 'Abrir pasta' 154 474 130 34
+    foreach ($b in $G.btnPular, $G.btnParar, $G.btnRel, $G.btnPasta) {
+        $b.FlatStyle = 'Flat'; $b.BackColor = [Drawing.Color]::FromArgb(44, 48, 58); $b.ForeColor = [Drawing.Color]::White
+        $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(60, 65, 78); $b.Enabled = $false
+    }
+    $G.btnPasta.Enabled = $true
+    $cfg.Controls.AddRange(@($G.btnIni, $G.btnPular, $G.btnParar, $G.btnRel, $G.btnPasta))
+    $dica = New-Ctl 'Label' 'Feche os programas e não use o PC durante o teste. Notebook: deixe na tomada. Se o PC desligar sozinho, ligue e rode de novo: o DiagPC registra em que etapa foi.' 16 516 270 48
+    $dica.ForeColor = Get-CorGui 'DarkGray'; $dica.Font = New-Object Drawing.Font('Segoe UI', 8)
+    $cfg.Controls.Add($dica)
+
+    # Leituras
+    $c1 = New-Card 'PROCESSADOR' 340 92; $G.cpuT = $c1[1]; $G.cpuI = $c1[2]
+    $c2 = New-Card 'PLACA DE VÍDEO' 554 92; $G.gpuT = $c2[1]; $G.gpuI = $c2[2]
+    $c3 = New-Card 'MEMÓRIA EM USO' 768 92; $G.ramT = $c3[1]; $G.ramI = $c3[2]
+    $f.Controls.AddRange(@($c1[0], $c2[0], $c3[0]))
+
+    $G.etapa = New-Ctl 'Label' 'Pronto para iniciar' 340 216 640 24
+    $G.etapa.Font = New-Object Drawing.Font('Segoe UI Semibold', 11); $G.etapa.ForeColor = [Drawing.Color]::White
+    $G.resta = New-Ctl 'Label' '' 340 240 640 22
+    $G.prog = New-Ctl 'ProgressBar' '' 340 266 640 10
+    $G.log = New-Ctl 'RichTextBox' '' 340 288 640 372
+    $G.log.ReadOnly = $true; $G.log.BorderStyle = 'None'; $G.log.BackColor = [Drawing.Color]::FromArgb(18, 20, 24)
+    $G.log.ForeColor = Get-CorGui 'Gray'; $G.log.Font = $G.fonteLog; $G.log.DetectUrls = $false
+    $f.Controls.AddRange(@($G.etapa, $G.resta, $G.prog, $G.log))
+
+    $atualizar = {
+        $G = $script:G
+        $pers = $G.rbP.Checked
+        foreach ($c in $G.ckRam, $G.ckCpu, $G.ckGpu, $G.ckDisco) { $c.Enabled = $pers }
+        $G.nMin.Enabled = $pers
+        if ($G.rbD.Checked) { foreach ($c in $G.ckRam, $G.ckCpu, $G.ckGpu, $G.ckDisco) { $c.Checked = $false } }
+        elseif (-not $pers) { foreach ($c in $G.ckRam, $G.ckCpu, $G.ckGpu, $G.ckDisco) { $c.Checked = $true } }
+        if ($G.rbR.Checked) { $G.nMin.Value = 10 } elseif ($G.rbC.Checked) { $G.nMin.Value = 30 } elseif ($G.rbD.Checked) { $G.nMin.Value = 5 } elseif ($G.nMin.Value -lt 15) { $G.nMin.Value = 45 }
+    }
+    $G.atualizar = $atualizar
+    foreach ($rb in $G.rbR, $G.rbC, $G.rbP, $G.rbD) { $rb.Add_CheckedChanged($atualizar) }
+    & $atualizar
+
+    $G.btnPular.Add_Click({ $script:PularSolicitado = $true; Add-GuiLog '   Pulando etapa...' 'Yellow' })
+    $G.btnParar.Add_Click({
+            $r = [Windows.Forms.MessageBox]::Show('Parar o teste agora? Um relatório parcial será gerado.', 'DiagPC', 'YesNo', 'Question')
+            if ($r -eq 'Yes') { $script:CancelarSolicitado = $true; $script:G.btnParar.Enabled = $false }
+        })
+    $G.btnRel.Add_Click({ if ($script:ArqHtml -and (Test-Path $script:ArqHtml)) { Start-Process $script:ArqHtml } })
+    $G.btnPasta.Add_Click({ $p = $(if ($script:PastaRel -and (Test-Path $script:PastaRel)) { $script:PastaRel } else { $RelRoot }); Start-Process explorer.exe $p })
+
+    $G.btnIni.Add_Click({
+            $G = $script:G
+            $script:Modo = $(if ($G.rbR.Checked) { 'Rapido' } elseif ($G.rbC.Checked) { 'Completo' } elseif ($G.rbP.Checked) { 'Personalizado' } else { 'Diagnostico' })
+            $script:MinutosEscolhido = [int]$G.nMin.Value
+            $script:SemRAM = -not $G.ckRam.Checked; $script:SemCPU = -not $G.ckCpu.Checked
+            $script:SemGPU = -not $G.ckGpu.Checked; $script:SemDisco = -not $G.ckDisco.Checked
+            $script:DiasLogs = [int]$G.nDias.Value
+            $script:NaoAbrir = $true
+            foreach ($c in $G.rbR, $G.rbC, $G.rbP, $G.rbD, $G.ckRam, $G.ckCpu, $G.ckGpu, $G.ckDisco, $G.nMin, $G.nDias, $G.btnIni, $G.btnRel) { $c.Enabled = $false }
+            $G.btnPular.Enabled = $true; $G.btnParar.Enabled = $true
+            $G.log.Clear(); $G.prog.Value = 0
+            $script:Rodando = $true
+            try { Start-Diagnostico }
+            catch { Add-GuiLog ("   " + $_.Exception.Message) 'Yellow' }
+            finally {
+                $script:Rodando = $false
+                $G.btnPular.Enabled = $false; $G.btnParar.Enabled = $false
+                foreach ($c in $G.rbR, $G.rbC, $G.rbP, $G.rbD, $G.nDias, $G.btnIni) { $c.Enabled = $true }
+                & $G.atualizar
+                $G.btnIni.Text = 'NOVO TESTE'
+                $G.prog.Value = 100
+                if ($script:ArqHtml -and (Test-Path $script:ArqHtml)) {
+                    $G.btnRel.Enabled = $true
+                    $G.etapa.Text = 'Concluído - ' + $script:Veredito
+                    $G.etapa.ForeColor = Get-CorGui $(switch ($script:VereditoCls) { 'crit' { 'Red' } 'aten' { 'Yellow' } default { 'Green' } })
+                    $G.resta.Text = $script:ArqHtml
+                    Start-Process $script:ArqHtml
+                }
+                if ($script:FecharAoTerminar) { $script:G.f.Close() }
+            }
+        })
+
+    $f.Add_FormClosing({
+            param($s, $e)
+            if ($script:Rodando) {
+                $r = [Windows.Forms.MessageBox]::Show('Um teste está em andamento. Parar e fechar? Um relatório parcial será gerado.', 'DiagPC', 'YesNo', 'Warning')
+                if ($r -eq 'Yes') { $script:CancelarSolicitado = $true; $script:FecharAoTerminar = $true }
+                $e.Cancel = $true
+            }
+        })
+
+    Add-GuiLog "DiagPC versão $VersaoDiag - feito por Danilo Américo" 'Cyan' -Negrito
+    Add-GuiLog 'Escolha o modo e clique em INICIAR TESTE.' 'Gray'
+    [DiagSys]::OcultarConsole()
+    [void]$f.ShowDialog()
 }
 
-Write-Host ''
-Read-Host '   Pressione ENTER para fechar' | Out-Null
+# ---------------------------------------------------------------------------
+#  Início
+# ---------------------------------------------------------------------------
+if ($Console -or $Modo) {
+    [DiagSys]::DesativarQuickEdit()
+    Show-Banner
+    Read-MenuConsole
+    try { Start-Diagnostico } catch { Write-Host "   $($_.Exception.Message)" -ForegroundColor Yellow }
+    Write-Host ''
+    Read-Host '   Pressione ENTER para fechar' | Out-Null
+} else {
+    try { Show-Gui }
+    catch {
+        Write-Host "Erro na interface gráfica: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Use o modo console:  DiagPC.ps1 -Console' -ForegroundColor Yellow
+        Read-Host 'ENTER para sair' | Out-Null
+    }
+}
