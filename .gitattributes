@@ -1,0 +1,4 @@
+*.ps1 -text
+*.bat -text
+*.txt -text
+*.exe binary

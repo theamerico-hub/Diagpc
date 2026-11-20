@@ -1,0 +1,70 @@
+﻿DiagPC - diagnóstico de hardware
+================================
+
+COMO USAR
+Pela internet (PowerShell):
+   irm https://raw.githubusercontent.com/theamerico-hub/Diagpc/main/iniciar.ps1 | iex
+   (baixa para C:\DiagPC e abre como administrador)
+
+Pelo pendrive:
+1. Copie a pasta DiagPC inteira.
+2. Clique duas vezes em Iniciar-DiagPC.bat e aceite o pedido de administrador.
+3. Escolha o modo:
+   [1] Rápido      ~10 min
+   [2] Completo    ~30 min (recomendado)
+   [3] Personalizado (tempo e testes à escolha)
+   [4] Só diagnóstico ~2 min (logs, SMART e inventário, sem estresse)
+4. Não use o PC durante o teste. Se for notebook, deixe na tomada.
+5. No final o relatório abre sozinho no navegador. Ele fica em:
+   DiagPC\Relatorios\<NOME-DO-PC>_<data>\relatorio.html
+   (também tem resumo.txt e amostras_sensores.csv, com as leituras a cada 2 s)
+
+Durante cada etapa, aperte P para pular. Ctrl+C interrompe e gera um relatório parcial.
+
+SE O PC DESLIGAR NO MEIO DO TESTE
+Ligue o PC e rode o DiagPC de novo. Ele detecta que o teste anterior não terminou e
+informa em qual etapa e com qual temperatura o PC desligou. Isso ajuda a separar
+superaquecimento de problema de fonte.
+
+O QUE É TESTADO
+- Temperatura de CPU, GPU e SSD em repouso e sob carga, e queda de clock (throttling)
+- Estresse de CPU com conferência de cálculos (detecta instabilidade)
+- Memória RAM: padrões de bits na 75% da memória livre no momento
+- SSD/HD: gravação e leitura sem cache, com conferência dos dados e da velocidade
+- Placa de vídeo: estresse WebGL em tela cheia (Edge/Chrome); detecta travamento do driver
+- CPU e GPU juntos (testa a fonte)
+- SMART: saúde, desgaste, erros e temperatura dos discos
+- Logs do Windows: desligamentos inesperados, tela azul (com o código e a provável causa),
+  erros WHEA, erros de disco, driver de vídeo reiniciando, programas travando
+- Bateria, drivers com erro, pouca RAM, disco cheio, Windows em HD mecânico
+
+SENSORES
+Na primeira execução o DiagPC baixa o LibreHardwareMonitor (v0.9.4, código aberto)
+para a pasta "ferramentas". Precisa de internet só nessa vez. Depois a pasta pode ir
+no pendrive.
+- Sem internet: baixe o LibreHardwareMonitor-net472.zip v0.9.4 no GitHub e copie
+  todos os .dll para DiagPC\ferramentas.
+- O Windows Defender às vezes bloqueia o driver WinRing0 usado pelo LibreHardwareMonitor.
+  Nesse caso a temperatura da CPU pode não aparecer; o resto funciona. Se precisar,
+  libere a pasta "ferramentas" no Defender.
+- GPU NVIDIA: se o LibreHardwareMonitor falhar, o DiagPC lê pelo nvidia-smi.
+
+SAÚDE DOS DISCOS EM %
+Calculada a partir do SMART (smartctl, incluído na pasta ferramentas):
+- SSD NVMe: 100% menos o desgaste, limitado pela área reserva; erros de mídia descontam.
+- SSD SATA: desgaste padrão ou atributo de vida útil do fabricante.
+- HD: parte de 100% e desconta setores realocados, pendentes e incorrigíveis.
+90-100% Excelente | 80-89% Boa | 50-79% Atenção | abaixo de 50% Ruim.
+Erros de CRC (cabo SATA) são avisados à parte e não reduzem a saúde.
+
+LIMITAÇÕES
+- O teste de RAM cobre a memória livre do Windows, não 100% dos endereços. Para
+  confirmar um pente com defeito, use o MemTest86 em pendrive.
+- O estresse de CPU esquenta menos que o Prime95 com AVX. Superaquecimento real
+  aparece, mas um PC no limite pode passar.
+
+PARÂMETROS (PowerShell)
+  .\DiagPC.ps1 -Modo Completo
+  .\DiagPC.ps1 -Modo Personalizado -Minutos 60 -SemGPU
+  .\DiagPC.ps1 -Modo Rapido -DiasLogs 7 -NaoAbrir
+  Opções: -SemCPU -SemRAM -SemDisco -SemGPU -DiasLogs N -NaoAbrir
