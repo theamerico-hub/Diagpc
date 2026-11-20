@@ -42,7 +42,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$VersaoDiag = '1.1'
+$VersaoDiag = '1.2'
 
 # ---------------------------------------------------------------------------
 #  Administrador
@@ -1176,6 +1176,24 @@ function Get-Smartctl {
     }
 }
 
+function Write-SmartLog([string]$t) {
+    try { Add-Content -Path (Join-Path $PastaRel 'smart_log.txt') -Value ('[{0:HH:mm:ss}] {1}' -f (Get-Date), $t) -Encoding UTF8 } catch {}
+}
+
+function ConvertFrom-JsonSeguro([string]$txt) {
+    if (-not $txt) { return $null }
+    try { return ($txt | ConvertFrom-Json -ErrorAction Stop) }
+    catch {
+        Write-SmartLog "ConvertFrom-Json falhou ($($_.Exception.Message)); usando JavaScriptSerializer"
+        try {
+            Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+            $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $js.MaxJsonLength = 67108864
+            return $js.DeserializeObject($txt)
+        } catch { Write-SmartLog "JavaScriptSerializer falhou: $($_.Exception.Message)"; return $null }
+    }
+}
+
 function Get-SerialNorm([string]$s) { return ($s -replace '[^0-9A-Za-z]', '').ToUpperInvariant() }
 
 function Get-SmartAttr($j, [int]$id) {
@@ -1305,23 +1323,36 @@ function Get-SaudeArmazenamento {
     } catch {}
 
     # smartctl: atributos completos + saúde em %
+    foreach ($r in $script:Discos) { Write-SmartLog ("Windows: {0} | tipo {1} | barramento {2} | serial {3} | status {4} | desgaste {5}" -f $r.Nome, $r.Tipo, $r.Barramento, $r.Serial, $r.Saude, $r.Desgaste) }
+    $lidosSmart = 0
     $sc = Get-Smartctl
+    Write-SmartLog "smartctl: $(if ($sc) { $sc } else { 'indisponível' })"
     if ($sc) {
-        try {
-            $scan = (& $sc --scan -j 2>$null) -join "`n" | ConvertFrom-Json
-            foreach ($dev in @($scan.devices)) {
-                $j = $null
-                $argsSc = @('-a', '-j', '-d', $dev.type, $dev.name)
-                if ("$($dev.type)" -notmatch 'nvme') { $argsSc = @('-a', '-l', 'devstat', '-j', '-d', $dev.type, $dev.name) }
-                try { $j = (& $sc @argsSc 2>$null) -join "`n" | ConvertFrom-Json } catch {}
-                if (-not $j -or (-not $j.ata_smart_attributes -and -not $j.nvme_smart_health_information_log)) { continue }
+        $scanTxt = ''
+        try { $scanTxt = (& $sc --scan-open -j 2>&1 | ForEach-Object { "$_" }) -join "`n" } catch { Write-SmartLog "scan falhou: $($_.Exception.Message)" }
+        Write-SmartLog "scan (código $LASTEXITCODE): $scanTxt"
+        $scan = ConvertFrom-JsonSeguro $scanTxt
+        foreach ($dev in @($scan.devices)) {
+            if (-not $dev) { continue }
+            try {
+                $argsSc = @('-a', '-j', '-d', "$($dev.type)", "$($dev.name)")
+                if ("$($dev.type)" -notmatch 'nvme') { $argsSc = @('-a', '-l', 'devstat', '-j', '-d', "$($dev.type)", "$($dev.name)") }
+                $txt = (& $sc @argsSc 2>$null | ForEach-Object { "$_" }) -join "`n"
+                Write-SmartLog ("{0} ({1}) código {2}, {3} caracteres" -f $dev.name, $dev.type, $LASTEXITCODE, $txt.Length)
+                $j = ConvertFrom-JsonSeguro $txt
+                if (-not $j -or (-not $j.ata_smart_attributes -and -not $j.nvme_smart_health_information_log)) {
+                    $msgs = ''
+                    try { $msgs = (@($j.smartctl.messages) | ForEach-Object { $_.string }) -join ' / ' } catch {}
+                    Write-SmartLog "  sem dados SMART. $msgs"
+                    continue
+                }
                 $nm = "$($j.model_name)".Trim()
-                if (-not $nm) { $nm = $dev.name }
+                if (-not $nm) { $nm = "$($dev.name)" }
 
                 # associa ao disco do Windows pelo número de série (ou modelo)
                 $ser = Get-SerialNorm "$($j.serial_number)"
                 $row = $script:Discos | Where-Object { $ser -and $_.Serial -and ($_.Serial -eq $ser -or $_.Serial.Contains($ser) -or $ser.Contains($_.Serial)) } | Select-Object -First 1
-                if (-not $row) { $row = $script:Discos | Where-Object { $_.SaudePct -eq $null -and $nm -and $_.Nome -like "*$nm*" } | Select-Object -First 1 }
+                if (-not $row) { $row = $script:Discos | Where-Object { $null -eq $_.SaudePct -and $nm -and ($_.Nome -like "*$nm*" -or $nm -like "*$($_.Nome)*") } | Select-Object -First 1 }
                 if (-not $row) {
                     $row = [pscustomobject]@{
                         Disco = $nm; Nome = $nm; Serial = $ser; Tipo = ''; Barramento = "$($dev.type)"
@@ -1332,23 +1363,56 @@ function Get-SaudeArmazenamento {
                     $script:Discos.Add($row)
                 }
                 $h = Get-SaudePct $j
+                $lidosSmart++
+                Write-SmartLog "  $nm (serial $ser): saúde $($h.Pct)% - $($h.Motivos)"
                 $row.SaudePct = $h.Pct; $row.SaudeRotulo = Get-RotuloSaude $h.Pct; $row.SaudeMotivo = $h.Motivos
                 if ($row.Tipo -in '', 'Unspecified') { $row.Tipo = $(if ($h.Ssd) { 'SSD' } else { 'HDD' }) }
                 if ($row.Temperatura -eq '--' -and $j.temperature.current) { $row.Temperatura = "$($j.temperature.current) °C" }
                 if ($row.HorasLigado -eq '--' -and $j.power_on_time.hours) { $row.HorasLigado = $j.power_on_time.hours }
 
-                # alertas específicos
-                foreach ($a in @($j.ata_smart_attributes.table)) {
-                    $rv = [int64]$a.raw.value
-                    switch ($a.id) {
+                foreach ($at in @($j.ata_smart_attributes.table)) {
+                    if (-not $at) { continue }
+                    $rv = [int64]$at.raw.value
+                    switch ([int]$at.id) {
                         5 { if ($rv -gt 0) { $script:Flags.SmartRuim = $true; Add-Achado $(if ($rv -gt 50) { 'CRITICO' } else { 'ATENCAO' }) 'Saúde do disco' "$nm - $rv setor(es) realocado(s)" 'Setores defeituosos já substituídos. Se aumentar, o disco está morrendo.' } }
                         197 { if ($rv -gt 0) { $script:Flags.SmartRuim = $true; Add-Achado CRITICO 'Saúde do disco' "$nm - $rv setor(es) pendente(s)" 'Setores instáveis/ilegíveis: causa travamentos longos.' } }
                         198 { if ($rv -gt 0) { $script:Flags.SmartRuim = $true; Add-Achado CRITICO 'Saúde do disco' "$nm - $rv setor(es) incorrigível(is)" '' } }
                         199 { if ($rv -gt 0) { Add-Achado ATENCAO 'Saúde do disco' "$nm - $rv erro(s) de comunicação (CRC)" 'Troque o cabo SATA ou a porta. Não reduz a saúde do disco.' } }
                     }
                 }
+            } catch { Write-SmartLog "  erro em $($dev.name): $($_.Exception.Message)" }
+        }
+    }
+
+    # LibreHardwareMonitor: segunda fonte (NVMe "Percentage Used", SATA "Remaining Life")
+    if ($script:LHM) {
+        try {
+            foreach ($hw in $script:LHM.Hardware) {
+                if ($hw.HardwareType.ToString() -ne 'Storage') { continue }
+                $hw.Update()
+                $nmL = "$($hw.Name)".Trim()
+                $row = $script:Discos | Where-Object { $_.Nome -like "*$nmL*" -or $nmL -like "*$($_.Nome)*" } | Select-Object -First 1
+                $sens = @($hw.Sensors)
+                Write-SmartLog ("LHM: {0} -> {1}" -f $nmL, (($sens | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join '; '))
+                if (-not $row) { continue }
+                $tmp = $sens | Where-Object { $_.SensorType.ToString() -eq 'Temperature' -and $_.Value -gt 0 } | Select-Object -First 1
+                if ($row.Temperatura -eq '--' -and $tmp) { $row.Temperatura = '{0:N0} °C' -f $tmp.Value }
+                if ($null -ne $row.SaudePct) { continue }
+                $usado = $sens | Where-Object { $_.Name -eq 'Percentage Used' -and $null -ne $_.Value } | Select-Object -First 1
+                $resta = $sens | Where-Object { $_.Name -eq 'Remaining Life' -and $null -ne $_.Value } | Select-Object -First 1
+                $spare = $sens | Where-Object { $_.Name -eq 'Available Spare' -and $null -ne $_.Value } | Select-Object -First 1
+                $p = $null; $mot = @()
+                if ($usado) { $p = 100 - [Math]::Min(100, [double]$usado.Value); if ($usado.Value -gt 0) { $mot += ('desgaste {0:N0}%' -f $usado.Value) } }
+                elseif ($resta) { $p = [Math]::Min(100, [double]$resta.Value); if ($p -lt 100) { $mot += ('vida útil restante {0:N0}%' -f $resta.Value) } }
+                if ($null -ne $p -and $spare -and $spare.Value -lt 100) { $p = [Math]::Min($p, [double]$spare.Value); $mot += ('área reserva {0:N0}%' -f $spare.Value) }
+                if ($null -ne $p) {
+                    $p = [int][Math]::Round([Math]::Max(0, $p))
+                    $row.SaudePct = $p; $row.SaudeRotulo = Get-RotuloSaude $p
+                    $row.SaudeMotivo = (@($mot) + 'fonte: LibreHardwareMonitor') -join ', '
+                    $lidosSmart++
+                }
             }
-        } catch {}
+        } catch { Write-SmartLog "LHM storage erro: $($_.Exception.Message)" }
     }
 
     # sem smartctl: usa o desgaste informado pelo Windows (normalmente só NVMe)
@@ -1359,6 +1423,14 @@ function Get-SaudeArmazenamento {
             $row.SaudePct = $p; $row.SaudeRotulo = Get-RotuloSaude $p
             $row.SaudeMotivo = $(if ($row.WearWin -gt 0) { "desgaste $($row.WearWin)% (Windows)" } else { '' })
         }
+    }
+
+    $semDados = @($script:Discos | Where-Object { $null -eq $_.SaudePct })
+    if ($semDados.Count) {
+        $raid = @($semDados | Where-Object { $_.Barramento -match 'RAID' })
+        $det = 'Veja smart_log.txt na pasta do relatório.'
+        if ($raid.Count) { $det = 'O disco está atrás de uma controladora Intel RST/VMD (modo RAID), que bloqueia a leitura do SMART. Programas como CrystalDiskInfo também costumam não ler nesse caso. ' + $det }
+        Add-Achado INFO 'Saúde do disco' ('Saúde em % indisponível para: {0}' -f (($semDados | ForEach-Object { $_.Nome }) -join ', ')) $det
     }
 
     # resultado por disco
@@ -1374,9 +1446,6 @@ function Get-SaudeArmazenamento {
         } else {
             Add-Achado OK 'Saúde do disco' $tit $det
         }
-    }
-    if (-not @($script:Achados | Where-Object { $_.Categoria -eq 'Saúde do disco' }).Count) {
-        Add-Achado INFO 'Saúde do disco' ('Status do Windows OK em {0} disco(s); saúde em % indisponível' -f $pds.Count) 'O smartctl não pôde ser usado neste PC.'
     }
 }
 
