@@ -42,7 +42,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$VersaoDiag = '1.2'
+$VersaoDiag = '1.3'
 
 # ---------------------------------------------------------------------------
 #  Administrador
@@ -493,7 +493,27 @@ function Get-Eventos {
     $f = @{ LogName = $Log; StartTime = $Desde }
     if ($Provider) { $f.ProviderName = $Provider }
     if ($Id) { $f.Id = $Id }
-    @(Get-WinEvent -FilterHashtable $f -ErrorAction SilentlyContinue)
+    try { return @(Get-WinEvent -FilterHashtable $f -ErrorAction Stop) }
+    catch {
+        if ($_.Exception.Message -notmatch 'No events were found|Nenhum evento|não foram encontrados|nao foram encontrados') {
+            # alguns PCs recusam a consulta com Id: tenta sem Id e filtra depois
+            try {
+                $f.Remove('Id')
+                $r = @(Get-WinEvent -FilterHashtable $f -ErrorAction Stop)
+                if ($Id) { $r = @($r | Where-Object { $Id -contains $_.Id }) }
+                return $r
+            } catch { return @() }
+        }
+        return @()
+    }
+}
+
+function Invoke-Seguro([string]$nome, [scriptblock]$bloco) {
+    try { & $bloco }
+    catch {
+        Write-Host ''
+        Add-Achado INFO 'Execução' "Erro interno na etapa: $nome (as outras etapas continuaram)" $_.Exception.Message
+    }
 }
 
 function Get-Num($v) {
@@ -715,12 +735,12 @@ function Read-Sensores {
         } catch {}
     }
     # Fallback ACPI (impreciso)
-    if ($null -eq $s.CpuTemp -and -not $script:LHM) {
+    if ($null -eq $s.CpuTemp -and -not $script:SemAcpi) {
         try {
             $tz = @(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop)
             $m = ($tz | ForEach-Object { $_.CurrentTemperature / 10 - 273.15 } | Where-Object { $_ -gt 5 -and $_ -lt 130 } | Measure-Object -Maximum).Maximum
-            if ($m) { $s.CpuTemp = $m; $script:FonteTempCpu = 'zona térmica ACPI (aproximado)' }
-        } catch {}
+            if ($m) { $s.CpuTemp = $m; $script:FonteTempCpu = 'zona térmica ACPI (aproximado)' } else { $script:SemAcpi = $true }
+        } catch { $script:SemAcpi = $true }
     }
     # Fallback carga GPU
     if ($null -eq $s.GpuLoad -and $script:GpuAtivo) {
@@ -1810,9 +1830,10 @@ try {
     if ($null -ne $st.CpuTempMed) {
         if ($st.CpuTempMed -ge $LIM.CpuRepousoCritico) { $script:Flags.CpuQuente = $true; Add-Achado CRITICO 'Temperatura' ('Processador muito quente EM REPOUSO: {0:N0} °C' -f $st.CpuTempMed) 'Cooler parado/solto, pasta térmica seca ou poeira acumulada.' }
         elseif ($st.CpuTempMed -ge $LIM.CpuRepousoAtencao) { $script:Flags.CpuMorno = $true; Add-Achado ATENCAO 'Temperatura' ('Processador quente em repouso: {0:N0} °C' -f $st.CpuTempMed) 'O normal em repouso é 30-55 °C (notebooks até ~60 °C).' }
-        else { Add-Achado OK 'Temperatura' ('Processador em repouso: {0:N0} °C' -f $st.CpuTempMed) }
+        else { Add-Achado OK 'Temperatura' ('Processador em repouso: {0:N0} °C' -f $st.CpuTempMed) $(if ($script:FonteTempCpu -like '*ACPI*') { 'Leitura pela zona térmica ACPI (aproximada).' } else { '' }) }
     } else {
-        Add-Achado INFO 'Temperatura' 'Não foi possível ler a temperatura do processador' "Sensor indisponível ($($script:LHMErro)). Veja a seção Sensores no LEIA-ME."
+        $motivoT = $(if ($script:LHM) { 'O LibreHardwareMonitor carregou, mas o driver de leitura da CPU (WinRing0) provavelmente foi bloqueado pelo Windows (lista de drivers vulneráveis / Integridade de Memória) ou pelo antivírus. GPU e discos continuam sendo lidos.' } else { "Sensor indisponível ($($script:LHMErro))." })
+        Add-Achado INFO 'Temperatura' 'Não foi possível ler a temperatura do processador' $motivoT
     }
     if ($null -ne $st.GpuTempMed -and $st.GpuTempMed -ge 70) { Add-Achado ATENCAO 'Temperatura' ('Placa de vídeo quente em repouso: {0:N0} °C' -f $st.GpuTempMed) 'Ventoinhas da placa podem estar paradas/sujas.' }
     if ($null -ne $st.CpuLoadMed -and $st.CpuLoadMed -ge 30) {
@@ -1820,9 +1841,9 @@ try {
         Add-Achado ATENCAO 'Desempenho' ('Processador {0:N0}% ocupado em repouso' -f $st.CpuLoadMed) "Algo está consumindo CPU em segundo plano (processos com mais CPU acumulada: $top). Pode ser atualização do Windows, antivírus ou malware."
     }
 
-    Get-Inventario
-    Get-AnaliseEventos
-    Get-SaudeArmazenamento
+    Invoke-Seguro 'Informações do computador' { Get-Inventario }
+    Invoke-Seguro 'Logs do Windows' { Get-AnaliseEventos }
+    Invoke-Seguro 'Saúde dos discos' { Get-SaudeArmazenamento }
     $script:InicioTestes = Get-Date
 
     # --- Disco ---
@@ -1968,7 +1989,7 @@ try {
         }
     }
 
-    Test-EventosDuranteTeste
+    Invoke-Seguro 'Eventos durante o teste' { Test-EventosDuranteTeste }
     $script:Concluido = $true
 }
 finally {
