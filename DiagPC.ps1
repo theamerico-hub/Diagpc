@@ -1550,6 +1550,7 @@ function Get-Conclusoes {
     if ($F.Desligamentos -and $F.DesligSemTela) {
         if ($quente) { $C.Add('Desligamentos sem tela azul + temperaturas críticas no teste: provável SUPERAQUECIMENTO.') }
         elseif ($F.Emergencia) { $C.Add('Temperatura chegou ao nível de emergência no teste: resolva a refrigeração antes de qualquer outra coisa.') }
+        elseif (-not @($script:Fases | Where-Object { $_.Nome -match 'Estresse|combinado' }).Count) { $C.Add('Há desligamentos sem tela azul nos logs, mas nenhum teste de estresse foi feito nesta execução: rode o modo Completo para ver se é superaquecimento ou fonte.') }
         else { $C.Add('Desligamentos sem tela azul, mas as temperaturas ficaram normais e o PC aguentou o teste: verifique fonte (falha intermitente), cabo de força, tomada/estabilizador, botão power e se o usuário está forçando o desligamento depois de travar.') }
     }
     if ($F.RamErros -or $F.BsodRam) { $C.Add('MEMÓRIA RAM suspeita: teste um pente por vez, limpe os contatos (borracha), desative XMP/DOCP na BIOS. Para confirmar, use MemTest86 em pendrive.') }
